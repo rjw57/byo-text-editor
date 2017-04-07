@@ -2,8 +2,10 @@
 #define _BSD_SOURCE
 #define _GNU_SOURCE
 
+#include <assert.h>
 #include <ctype.h>
 #include <errno.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 //// DATA TYPES
@@ -27,7 +30,9 @@ struct abuf {
 // A row of display text
 typedef struct erow {
   ssize_t size;
+  ssize_t r_size;
   uint8_t* chars;
+  uint8_t* render;
 } erow;
 
 // The state of our editor.
@@ -35,17 +40,34 @@ struct editor_config {
   // Original terminal config on launch.
   struct termios orig_termios;
 
-  // Terminal window size.
+  // Editor window size.
+  // Note: this is not necessarily the terminal size. For a start, this does not
+  // include the status bar.
   int screen_rows, screen_cols;
 
   // Current cursor position.
   int cx, cy;
+
+  // Current position within *rendered* line.
+  int rx;
+
+  // Current scroll offset.
+  int row_off, col_off;
 
   // Number of rows in file
   int num_rows;
 
   // An array of rows
   erow* row;
+
+  // The current filename
+  char* filename;
+
+  // Status message displayed to user
+  char status_msg[80];
+
+  // When status message was last shown
+  time_t status_msg_time;
 };
 
 //// GLOBALS
@@ -61,8 +83,14 @@ struct editor_config E;
 // Byte corresponding to CTRL-<key>
 #define CTRL_KEY(key) ((key) & 0x1f)
 
-// Co-erce string to uint8_t pointer
+// Coerce string to uint8_t pointer
 #define U8(str) ((uint8_t*)(str))
+
+// Tab stop size
+#define KILO_TAB_STOP 8
+
+// Time (in seconds) to display status messages
+#define KILO_MSG_TIMEOUT 5
 
 // Special key values
 enum special_keys {
@@ -239,12 +267,96 @@ int editor_read_key(void) {
   return c;
 }
 
+//// Row-wise operations
+
+// Compute the rendered x-position for a given cursor offset in a row
+int editor_row_cx_to_rx(erow* row, int cx) {
+  int rx = 0;
+  for(int j=0; j < cx; ++j) {
+    if(row->chars[j] == '\t') {
+      rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+    }
+    ++rx;
+  }
+  return rx;
+}
+
+// Update a row structure after modification by re-computing it's rendered form.
+void editor_update_row(erow* row) {
+  int tabs = 0;
+  for(int j=0; j<row->size; ++j) {
+    if(row->chars[j] == '\t') { ++tabs; }
+  }
+
+  free(row->render);
+  row->render = malloc(row->size + tabs*(KILO_TAB_STOP-1) + 1);
+
+  int idx = 0;
+  for(int j=0; j<row->size; ++j) {
+    if(row->chars[j] == '\t') {
+      row->render[idx++] = ' ';
+      while(idx % KILO_TAB_STOP != 0) { row->render[idx++] = ' '; }
+    } else {
+      row->render[idx++] = row->chars[j];
+    }
+  }
+  row->render[idx] = '\0';
+  row->r_size = idx;
+}
+
+// Append a row to the file
+void editor_append_row(uint8_t *buf, size_t len) {
+  E.row = realloc(E.row, sizeof(erow) * (E.num_rows + 1));
+
+  int at = E.num_rows;
+  E.row[at].size = len;
+  E.row[at].chars = malloc(len + 1);
+  memcpy(E.row[at].chars, buf, len);
+  E.row[at].chars[len] = '\0';
+
+  E.row[at].r_size = 0;
+  E.row[at].render = NULL;
+  editor_update_row(&E.row[at]);
+
+  ++E.num_rows;
+}
+
 //// OUTPUT
+
+// Scroll editor to ensure cursor is on-screen
+void editor_scroll(void) {
+  // Set rx
+  E.rx = 0;
+  if(E.cy < E.num_rows) {
+    E.rx = editor_row_cx_to_rx(&(E.row[E.cy]), E.cx);
+  }
+
+  if(E.cy < E.row_off) {
+    E.row_off = E.cy;
+  }
+
+  if(E.cy >= E.row_off + E.screen_rows) {
+    E.row_off = E.cy - E.screen_rows + 1;
+  }
+
+  if(E.rx < E.col_off) {
+    E.col_off = E.rx;
+  }
+
+  if(E.rx >= E.col_off + E.screen_cols) {
+    E.col_off = E.rx - E.screen_cols + 1;
+  }
+
+  assert(E.row_off >= 0);
+  assert(E.col_off >= 0);
+}
 
 // Draw each row of the screen into the output buffer
 void editor_draw_rows(struct abuf *ab) {
   for(int y=0; y<E.screen_rows; ++y) {
-    if(y >= E.num_rows) {
+    int file_row = y + E.row_off;
+
+    if(file_row >= E.num_rows) {
       // off bottom of file
 
       // only display welcome message if no lines
@@ -264,18 +376,58 @@ void editor_draw_rows(struct abuf *ab) {
         ab_append(ab, U8("~"), 1);
       }
     } else {
-      int len = E.row[y].size;
+      int len = E.row[file_row].r_size - E.col_off;
+      if(len < 0) { len = 0; }
       if(len > E.screen_cols) { len = E.screen_cols; }
-      ab_append(ab, E.row[y].chars, len);
+      ab_append(ab, &(E.row[file_row].render[E.col_off]), len);
     }
 
     // Clear remainder of line
     ab_append(ab, U8("\x1b[K"), 3);
 
-    // For all but last line, add newline
-    if(y + 1 < E.screen_rows) {
-      ab_append(ab, U8("\r\n"), 2);
+    // Add newline
+    ab_append(ab, U8("\r\n"), 2);
+  }
+}
+
+// Draw status bar
+void editor_draw_status_bar(struct abuf *ab) {
+  // reverse video
+  ab_append(ab, U8("\x1b[7m"), 4);
+
+  char status[80], rstatus[80];
+  int len = snprintf(status, sizeof(status),
+      " %.20s - %d lines", E.filename ? E.filename : "[No Name]",
+      E.num_rows);
+  if(len > E.screen_cols) { len = E.screen_cols; }
+  ab_append(ab, (uint8_t*)status, len);
+
+  int rlen = snprintf(rstatus, sizeof(rstatus),
+      "%d/%d ", E.cy+1, E.num_rows);
+
+  while(len < E.screen_cols) {
+    if(E.screen_cols - len == rlen) {
+      ab_append(ab, (uint8_t*)rstatus, rlen);
+      break;
     }
+
+    ab_append(ab, U8(" "), 1);
+    ++len;
+  }
+
+  // normal video and new line
+  ab_append(ab, U8("\x1b[m\r\n"), 6);
+}
+
+// Draw status message (if any)
+void editor_draw_message_bar(struct abuf* ab) {
+  // Clear any existing line
+  ab_append(ab, U8("\x1b[K"), 3);
+
+  int msg_len = strlen(E.status_msg);
+  if(msg_len > E.screen_cols) { msg_len = E.screen_cols; }
+  if(msg_len && (time(NULL) - E.status_msg_time < KILO_MSG_TIMEOUT)) {
+    ab_append(ab, (uint8_t*)E.status_msg, msg_len);
   }
 }
 
@@ -283,19 +435,24 @@ void editor_draw_rows(struct abuf *ab) {
 void editor_refresh_screen(void) {
   struct abuf ab = ABUF_INIT;
 
+  // Set scroll position
+  editor_scroll();
+
   // Hide cursor
   ab_append(&ab, U8("\x1b[?25l"), 6);
 
   // Cursor -> top-left
   ab_append(&ab, U8("\x1b[H"), 3);
 
-  // Draw each row of the screen
+  // Draw the screen
   editor_draw_rows(&ab);
+  editor_draw_status_bar(&ab);
+  editor_draw_message_bar(&ab);
 
   // Cursor -> current position
   uint8_t buf[32];
   int buf_len = snprintf((char*)buf, sizeof(buf),
-      "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
+      "\x1b[%d;%dH", (E.cy - E.row_off) + 1, (E.rx - E.col_off) + 1);
   ab_append(&ab, buf, buf_len);
 
   // Show cursor
@@ -310,19 +467,17 @@ void editor_refresh_screen(void) {
   ab_free(&ab);
 }
 
-//// Row-wise operations
+// Set a status message. Takes a format string and arguments a la printf().
+void editor_set_status_message(const char* fmt, ...) {
+  va_list ap;
 
-// Append a row to the file
-void editor_append_row(uint8_t *buf, size_t len) {
-  E.row = realloc(E.row, sizeof(erow) * (E.num_rows + 1));
+  // Format message
+  va_start(ap, fmt);
+  vsnprintf(E.status_msg, sizeof(E.status_msg), fmt, ap);
+  va_end(ap);
 
-  int at = E.num_rows;
-  E.row[at].size = len;
-  E.row[at].chars = malloc(len + 1);
-  memcpy(E.row[at].chars, buf, len);
-  E.row[at].chars[len] = '\0';
-
-  ++E.num_rows;
+  // Record time
+  E.status_msg_time = time(NULL);
 }
 
 //// FILE I/O
@@ -331,6 +486,9 @@ void editor_append_row(uint8_t *buf, size_t len) {
 void editor_open(const char* filename) {
   FILE *fp = fopen(filename, "r");
   if(!fp) { die("fopen"); }
+
+  free(E.filename);
+  E.filename = strdup(filename);
 
   char *line = NULL;
   size_t linecap = 0;
@@ -353,20 +511,44 @@ void editor_open(const char* filename) {
 
 // Cursor movement
 void editor_move_cursor(int key) {
+  // Get row under current cursor
+  erow *row = (E.cy >= E.num_rows) ? NULL : &(E.row[E.cy]);
+
   switch(key) {
     case ARROW_LEFT:
-      if(E.cx > 0) { E.cx--; }
+      if(E.cx > 0) {
+        // simple case
+        E.cx--;
+      } else if(E.cy > 0) {
+        // end of previous line
+        E.cy--;
+        if(E.cy < E.num_rows) { E.cx = E.row[E.cy].size; }
+      }
       break;
     case ARROW_RIGHT:
-      if(E.cx < E.screen_cols - 1) { E.cx++; }
+      if(row && (E.cx < row->size)) {
+        // simple case
+        E.cx++;
+      } else if(row && (E.cx == row->size) && (E.cy < E.num_rows)) {
+        // start of next line
+        E.cy++;
+        E.cx = 0;
+      }
       break;
     case ARROW_UP:
       if(E.cy > 0) { E.cy--; }
       break;
     case ARROW_DOWN:
-      if(E.cy < E.screen_rows - 1) { E.cy++; }
+      if(E.cy < E.num_rows) { E.cy++; }
       break;
   }
+
+  // Get (possibly) new row under cursor
+  row = (E.cy >= E.num_rows) ? NULL : &(E.row[E.cy]);
+
+  // Snap cx to new row
+  int rowlen = row ? row->size : 0;
+  if(E.cx > rowlen) { E.cx = rowlen; }
 }
 
 // Read and process one key from the keyboard.
@@ -382,12 +564,23 @@ void editor_process_key(void) {
       E.cx = 0;
       break;
     case END_KEY:
-      E.cx = E.screen_cols - 1;
+      if(E.cy < E.num_rows) {
+        E.cx = E.row[E.cy].size;
+      }
       break;
 
     case PAGE_UP:
     case PAGE_DOWN:
       {
+        // Position cursor at top or bottom of page depending on keypress
+        if(c == PAGE_UP) {
+          E.cy = E.row_off;
+        } else if(c == PAGE_DOWN) {
+          E.cy = E.row_off + E.screen_rows - 1;
+        }
+
+        // Simulate multiple arrow key presses. Takes care of correcting any
+        // cursor positions due to line lengths, etc.
         int times = E.screen_rows;
         while(times--) {
           editor_move_cursor((c == PAGE_UP) ? ARROW_UP : ARROW_DOWN);
@@ -416,12 +609,29 @@ void init_editor() {
     die("window size");
   }
 
+  // Make room for status bar and message
+  E.screen_rows -= 2;
+
+  if(E.screen_rows < 1) {
+    die("terminal too small");
+  }
+
   // Reset cursor position
-  E.cx = E.cy = 0;
+  E.rx = E.cx = E.cy = 0;
+
+  // Reset scroll position
+  E.col_off = E.row_off = 0;
 
   // No rows
   E.num_rows = 0;
   E.row = NULL;
+
+  // No file
+  E.filename = NULL;
+
+  // No status
+  E.status_msg[0] = '\0';
+  E.status_msg_time = 0;
 }
 
 int main(int argc, char** argv) {
@@ -444,6 +654,9 @@ int main(int argc, char** argv) {
   if(argc >= 2) {
     editor_open(argv[1]);
   }
+
+  // Set a helpful status message
+  editor_set_status_message("HELP: Ctrl-Q = quit");
 
   // Input loop.
   while(1) {
