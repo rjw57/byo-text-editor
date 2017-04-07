@@ -39,12 +39,15 @@ typedef struct erow {
 
 // Syntax highlighting flags
 #define HL_HIGHLIGHT_NUMBERS (1<<0)
+#define HL_HIGHLIGHT_STRINGS (1<<1)
 
 // Syntax highlighting file type detection
 struct editor_syntax {
   char *filetype; // detected file type
   char **filematch; // filename patterns
   int flags; // what highlighting to perform
+  char *singleline_comment_start; // how do single line comments start?
+  char **keywords; // NULL-terminated array of keywords (2nd-ary term. with "|")
 };
 
 // The state of our editor.
@@ -98,11 +101,21 @@ struct editor_config E;
 
 // Filetype tables
 char *C_HL_extensions[] = { ".c", ".h", ".cpp", ".hpp", NULL };
+char *C_HL_keywords[] = {
+  "switch", "if", "while", "for", "break", "continue", "return",
+  "else", "struct", "union", "typedef", "static", "enum", "class",
+  "case",
+
+  "int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|",
+  "void|",
+  
+  NULL
+};
 
 struct editor_syntax HLDB[] = {
   {
-    "c", C_HL_extensions,
-    HL_HIGHLIGHT_NUMBERS,
+    "c", C_HL_extensions, HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS, "//",
+    C_HL_keywords,
   },
 };
 
@@ -152,6 +165,10 @@ enum special_keys {
 // Syntax highlighting tokens
 enum highlight_tokens {
   HL_NORMAL = 0,
+  HL_COMMENT,
+  HL_KEYWORD1,
+  HL_KEYWORD2,
+  HL_STRING,
   HL_NUMBER,
   HL_MATCH, // search match
 };
@@ -341,10 +358,53 @@ void editor_update_syntax(erow* row) {
   // was previous character a separator
   int prev_sep = 1;
 
+  // are we within a string? if so, set this to the terminating char.
+  int in_string = 0;
+
+  // what (if any) prefix denotes single line comments
+  char* scs = E.syntax->singleline_comment_start;
+  int scs_len = scs ? strlen(scs) : 0;
+
+  // keywords
+  char **keywords = E.syntax->keywords;
+
   int i=0;
   while(i < row->r_size) {
     char c = row->render[i];
     uint8_t prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
+
+    if(scs_len && !in_string) {
+      if(!strncmp((char*)&row->render[i], scs, scs_len)) {
+        // rest of line is a comment
+        memset(&row->hl[i], HL_COMMENT, row->r_size - i);
+        return;
+      }
+    }
+
+    if(E.syntax->flags & HL_HIGHLIGHT_STRINGS) {
+      if(in_string) {
+        row->hl[i] = HL_STRING;
+        
+        // handle escaped terminators
+        if((c == '\\') && (i + 1 < row->r_size)) {
+          row->hl[i + 1] = HL_STRING;
+          i += 2;
+          continue;
+        }
+        
+        if(c == in_string) { in_string = 0; }
+        ++i;
+        prev_sep = 1;
+        continue;
+      } else {
+        if((c == '"') || (c == '\'')) {
+          in_string = c;
+          row->hl[i] = HL_STRING;
+          i++;
+          continue;
+        }
+      }
+    }
 
     if(E.syntax->flags & HL_HIGHLIGHT_NUMBERS) {
       if((isdigit(c) && (prev_sep || (prev_hl == HL_NUMBER))) ||
@@ -356,6 +416,25 @@ void editor_update_syntax(erow* row) {
       }
     }
 
+    if(prev_sep) {
+      int j=0;
+      for(j=0; keywords[j]; ++j) {
+        int klen = strlen(keywords[j]);
+        int kw2 = keywords[j][klen-1] == '|';
+        if(kw2) { klen--; }
+
+        if(klen + i > row->r_size) { continue; }
+
+        if(!strncmp((char*)&row->render[i], keywords[j], klen) &&
+             is_separator(row->render[i + klen])) {
+           memset(&row->hl[i], kw2 ? HL_KEYWORD2 : HL_KEYWORD1, klen);
+           i += klen;
+           break;
+        }
+      }
+      if(keywords[j] != NULL) { prev_sep = 0; continue; }
+    }
+
     prev_sep = is_separator(c);
     ++i;
   }
@@ -364,6 +443,10 @@ void editor_update_syntax(erow* row) {
 // Convert a syntax highlight token to the corresponding ANSI color code
 int editor_syntax_to_colour(int hl) {
   switch(hl) {
+    case HL_COMMENT: return 36; // cyan
+    case HL_KEYWORD1: return 33; // yellow
+    case HL_KEYWORD2: return 32; // green
+    case HL_STRING: return 35; // magenta
     case HL_NUMBER: return 31; // red
     case HL_MATCH: return 34; // blue
     default: return 37; // white
