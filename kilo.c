@@ -122,7 +122,10 @@ enum special_keys {
 
 //// PROTOTYPES
 
-char* editor_prompt(char* prompt);
+// a callback taking the current input and last key pressed
+typedef void (*prompt_cb)(char*, int);
+
+char* editor_prompt(char* prompt, prompt_cb cb);
 
 //// UTILITY
 
@@ -295,6 +298,20 @@ int editor_row_cx_to_rx(erow* row, int cx) {
     ++rx;
   }
   return rx;
+}
+
+// Compute the cursor offset for the given rendered x-position
+int editor_row_rx_to_cx(erow* row, int rx_target) {
+  int rx = 0, cx = 0;
+  for(cx=0; cx < row->size; ++cx) {
+    if(row->chars[cx] == '\t') {
+      rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+    }
+    ++rx;
+
+    if(rx > rx_target) { return cx; }
+  }
+  return cx;
 }
 
 // Update a row structure after modification by re-computing it's rendered form.
@@ -716,7 +733,7 @@ char* editor_rows_to_string(int *buflen) {
 void editor_save(void) {
   if(E.filename == NULL) {
     // Prompt user for filename
-    E.filename = editor_prompt("Save as: %s");
+    E.filename = editor_prompt("Save as: %s", NULL);
     if(E.filename == NULL) {
       editor_set_status_message("Save aborted");
       return;
@@ -751,6 +768,78 @@ void editor_save(void) {
 
   // This path through the function indicates an error saving, report this.
   editor_set_status_message("error saving: %s", strerror(errno));
+}
+
+//// FIND
+
+void editor_find_callback(char *query, int key) {
+  static int start_match_rx = 0;
+  static int start_match_row = 0;
+  static int direction = 1;
+
+  if(iscntrl(key) && (key <= 0xff)) {
+    start_match_rx = 0;
+    start_match_row = 0;
+    direction = 1;
+    return;
+  } else if((key == ARROW_RIGHT) || (key == ARROW_DOWN)) {
+    direction = 1;
+  } else if((key == ARROW_LEFT) || (key == ARROW_UP)) {
+    direction = -1;
+  } else {
+    start_match_rx = 0;
+    start_match_row = 0;
+    direction = 1;
+  }
+
+  int current_rx = start_match_rx, current_row = start_match_row;
+
+  // search each row in turn
+  for(int i=0; i<E.num_rows; ++i) {
+    erow* row = &E.row[current_row];
+    char* match = strstr((char*)(&row->render[current_rx]), query);
+
+    // if match found, move cursor
+    if(match) {
+      int match_rx = match - (char*)row->render;
+      start_match_rx = match_rx + strlen(query);
+      start_match_row = current_row;
+
+      E.cy = current_row;
+      E.cx = editor_row_rx_to_cx(row, match_rx);
+
+      // cause editor_scroll() to place matching line at top of screen
+      E.row_off = E.num_rows;
+
+      return;
+    } else {
+      current_rx = 0;
+      current_row += direction;
+      if(current_row == -1) {
+        current_row = E.num_rows - 1;
+      } else if(current_row == E.num_rows) {
+        current_row = 0;
+      }
+    }
+  }
+}
+
+void editor_find(void) {
+  // save cursor and scroll position in case user cancels search
+  int scx = E.cx, scy = E.cy, srow_off = E.row_off, scol_off = E.col_off;
+
+  // show search prompt
+  char* query = editor_prompt("Search: %s (ESC/Ctrl-C cancels, Arrows continue)",
+      editor_find_callback);
+  if(query) {
+    free(query);
+  } else {
+    // user cancelled
+    E.cx = scx;
+    E.cy = scy;
+    E.col_off = scol_off;
+    E.row_off = srow_off;
+  }
 }
 
 //// INPUT HANDLING
@@ -821,6 +910,10 @@ void editor_process_key(void) {
       editor_save();
       break;
 
+    case CTRL_KEY('f'):
+      editor_find();
+      break;
+
     // Enter
     case ENTER_KEY:
       editor_insert_new_line();
@@ -885,7 +978,7 @@ void editor_process_key(void) {
 // Prompt for input from the user. Returns a string from the user which should be
 // free()-ed when done with. The promp should include a "%s" which is replaced with the
 // user's input as they type.
-char* editor_prompt(char* prompt) {
+char* editor_prompt(char* prompt, prompt_cb cb) {
   // allocate input buffer
   size_t buf_size = 128;
   char* buf = malloc(buf_size);
@@ -903,6 +996,7 @@ char* editor_prompt(char* prompt) {
     if((c == ESCAPE_KEY) || (c == CTRL_KEY('c'))) {
       // cancel on escape / Ctrl-C
       editor_set_status_message("");
+      if(cb) { cb(buf, c); }
       free(buf);
       return NULL;
     } else if(c == BACKSPACE) {
@@ -912,9 +1006,10 @@ char* editor_prompt(char* prompt) {
       // return buffer to caller if non-empty
       if(buf_len != 0) {
         editor_set_status_message("");
+        if(cb) { cb(buf, c); }
         return buf;
       }
-    } else if(!iscntrl(c)) {
+    } else if(!iscntrl(c) && (c <= 0xff)) {
       // realloc buffer if necessary
       if(buf_len == buf_size - 1) {
         buf_size *= 2;
@@ -923,6 +1018,9 @@ char* editor_prompt(char* prompt) {
       buf[buf_len++] = c;
       buf[buf_len] = '\0';
     }
+
+    // pass key to callback
+    if(cb) { cb(buf, c); } 
   }
 }
 
@@ -984,7 +1082,7 @@ int main(int argc, char** argv) {
   }
 
   // Set a helpful status message
-  editor_set_status_message("HELP: Ctrl-Q = quit");
+  editor_set_status_message("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find");
 
   // Input loop.
   while(1) {
