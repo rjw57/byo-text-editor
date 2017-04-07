@@ -1052,7 +1052,7 @@ char* editor_prompt(char* prompt, prompt_cb cb) {
     }
 
     // pass key to callback
-    if(cb) { cb(buf, c); } 
+    if(cb) { cb(buf, c); }
   }
 }
 
