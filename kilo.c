@@ -34,7 +34,18 @@ typedef struct erow {
   ssize_t r_size;
   uint8_t* chars;
   uint8_t* render;
+  uint8_t* hl; // token types for each byte in render
 } erow;
+
+// Syntax highlighting flags
+#define HL_HIGHLIGHT_NUMBERS (1<<0)
+
+// Syntax highlighting file type detection
+struct editor_syntax {
+  char *filetype; // detected file type
+  char **filematch; // filename patterns
+  int flags; // what highlighting to perform
+};
 
 // The state of our editor.
 struct editor_config {
@@ -75,12 +86,27 @@ struct editor_config {
 
   // When status message was last shown
   time_t status_msg_time;
+
+  // Syntax highlighting information for current file
+  struct editor_syntax* syntax;
 };
 
 //// GLOBALS
 
 // Short, pithy name for "global editor".
 struct editor_config E;
+
+// Filetype tables
+char *C_HL_extensions[] = { ".c", ".h", ".cpp", ".hpp", NULL };
+
+struct editor_syntax HLDB[] = {
+  {
+    "c", C_HL_extensions,
+    HL_HIGHLIGHT_NUMBERS,
+  },
+};
+
+#define HLDB_ENTRIES (sizeof(HLDB) / sizeof(HLDB[0]))
 
 //// MACROS
 
@@ -121,6 +147,13 @@ enum special_keys {
 
   PAGE_UP,
   PAGE_DOWN,
+};
+
+// Syntax highlighting tokens
+enum highlight_tokens {
+  HL_NORMAL = 0,
+  HL_NUMBER,
+  HL_MATCH, // search match
 };
 
 //// PROTOTYPES
@@ -289,6 +322,86 @@ int editor_read_key(void) {
   return c;
 }
 
+//// SYNTAX HIGHLIGHTING
+
+// returns non-zero id c is a separator character
+int is_separator(int c) {
+  return isspace(c) || (c == '\0') || (strchr(",.()+-/*=~%<>[];", c) != NULL);
+}
+
+// Update syntax highlighting for a single row
+void editor_update_syntax(erow* row) {
+  // re-allocate hl buffer
+  row->hl = realloc(row->hl, row->r_size);
+  memset(row->hl, HL_NORMAL, row->r_size);
+
+  // if there's no syntax highlighting info, that's all
+  if(E.syntax == NULL) { return; }
+
+  // was previous character a separator
+  int prev_sep = 1;
+
+  int i=0;
+  while(i < row->r_size) {
+    char c = row->render[i];
+    uint8_t prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
+
+    if(E.syntax->flags & HL_HIGHLIGHT_NUMBERS) {
+      if((isdigit(c) && (prev_sep || (prev_hl == HL_NUMBER))) ||
+         ((c == '.') && (prev_hl == HL_NUMBER))) {
+        row->hl[i] = HL_NUMBER;
+        ++i;
+        prev_sep = 0;
+        continue;
+      }
+    }
+
+    prev_sep = is_separator(c);
+    ++i;
+  }
+}
+
+// Convert a syntax highlight token to the corresponding ANSI color code
+int editor_syntax_to_colour(int hl) {
+  switch(hl) {
+    case HL_NUMBER: return 31; // red
+    case HL_MATCH: return 34; // blue
+    default: return 37; // white
+  }
+}
+
+// Match current filename to a set of syntax highlighting rules
+void editor_select_syntax_highlight(void) {
+  // reset any existing association
+  E.syntax = NULL;
+
+  // if there's no filename, that's it
+  if(E.filename == NULL) { return; }
+
+  // loop over each entry
+  for(unsigned int j=0; j<HLDB_ENTRIES; ++j) {
+    struct editor_syntax* s = &HLDB[j];
+
+    // loop over filematch entries
+    for(int i=0; s->filematch[i] != NULL; ++i) {
+      char* p = strstr(E.filename, s->filematch[i]);
+      if(p != NULL) {
+        int patlen = strlen(s->filematch[i]);
+        if((s->filematch[i][0] != '.') || (p[patlen] == '\0')) {
+          // it's a match!
+          E.syntax = s;
+
+          // re-highlight file
+          for(int file_row=0; file_row < E.num_rows; ++file_row) {
+            editor_update_syntax(&E.row[file_row]);
+          }
+          return;
+        }
+      }
+    }
+  }
+}
+
 //// Row-wise operations
 
 // Compute the rendered x-position for a given cursor offset in a row
@@ -338,12 +451,16 @@ void editor_update_row(erow* row) {
   }
   row->render[idx] = '\0';
   row->r_size = idx;
+
+  // re-compute syntax highlighting
+  editor_update_syntax(row);
 }
 
 // Free resources associated with a row
 void editor_free_row(erow* row) {
   free(row->render);
   free(row->chars);
+  free(row->hl);
 }
 
 // Delete a row from the file
@@ -383,6 +500,7 @@ void editor_insert_row(int at, uint8_t *buf, size_t len) {
   // Re-render row
   E.row[at].r_size = 0;
   E.row[at].render = NULL;
+  E.row[at].hl = NULL;
   editor_update_row(&E.row[at]);
 
   // set dirty bit
@@ -591,10 +709,41 @@ void editor_draw_rows(struct abuf *ab) {
         ab_append(ab, U8("~"), 1);
       }
     } else {
+      // within file
       int len = E.row[file_row].r_size - E.col_off;
       if(len < 0) { len = 0; }
       if(len > E.screen_cols) { len = E.screen_cols; }
-      ab_append(ab, &(E.row[file_row].render[E.col_off]), len);
+
+      // get rendered string from start of output line
+      uint8_t* c = &E.row[file_row].render[E.col_off];
+
+      // get highlight tokens
+      uint8_t* hl = &E.row[file_row].hl[E.col_off];
+
+      // append string with colours
+      int current_colour = -1;
+      for(int j=0; j<len; ++j) {
+        if(hl[j] == HL_NORMAL) {
+          // only reset colour if necessary
+          if(current_colour != -1) {
+            ab_append(ab, U8("\x1b[39m"), 5);
+            current_colour = -1;
+          }
+          ab_append(ab, &c[j], 1);
+        } else {
+          int colour = editor_syntax_to_colour(hl[j]);
+          if(colour != current_colour) {
+            uint8_t buf[16];
+            int clen = snprintf((char*)buf, sizeof(buf), "\x1b[%dm", colour);
+            ab_append(ab, buf, clen);
+            current_colour = colour;
+          }
+          ab_append(ab, &c[j], 1);
+        }
+      }
+
+      // reset colour before next line
+      ab_append(ab, U8("\x1b[39m"), 5);
     }
 
     // Clear remainder of line
@@ -618,7 +767,9 @@ void editor_draw_status_bar(struct abuf *ab) {
   ab_append(ab, (uint8_t*)status, len);
 
   int rlen = snprintf(rstatus, sizeof(rstatus),
-      "%d/%d ", E.cy+1, E.num_rows);
+      "%s | %d/%d ",
+      E.syntax ? E.syntax->filetype : "no ft",
+      E.cy+1, E.num_rows);
 
   while(len < E.screen_cols) {
     if(E.screen_cols - len == rlen) {
@@ -705,6 +856,9 @@ void editor_open(const char* filename) {
   free(E.filename);
   E.filename = strdup(filename);
 
+  // match syntax highlighting
+  editor_select_syntax_highlight();
+
   char *line = NULL;
   size_t linecap = 0;
   ssize_t linelen;
@@ -763,6 +917,9 @@ void editor_save(void) {
     }
   }
 
+  // Match syntax highlighting
+  editor_select_syntax_highlight();
+
   // Convert editor rows to a string for saving
   int len;
   char *buf = editor_rows_to_string(&len);
@@ -800,15 +957,26 @@ void editor_find_callback(char *query, int key) {
   static int start_match_row = 0;
   static int direction = 1;
 
-  if(iscntrl(key) && (key <= 0xff)) {
-    start_match_rx = 0;
-    start_match_row = 0;
-    direction = 1;
-    return;
-  } else if((key == ARROW_RIGHT) || (key == ARROW_DOWN)) {
+  // static variables used to save the row number and contents of the
+  // previous contents of hl before the search match is highlighted
+  static int saved_hl_row;
+  static uint8_t* saved_hl = NULL;
+
+  // If there was a saved hl line from a previous match, restore it
+  if(saved_hl) {
+    memcpy(E.row[saved_hl_row].hl, saved_hl, E.row[saved_hl_row].r_size);
+    free(saved_hl);
+    saved_hl = NULL;
+  }
+
+  if((key == ARROW_RIGHT) || (key == ARROW_DOWN)) {
     direction = 1;
   } else if((key == ARROW_LEFT) || (key == ARROW_UP)) {
     direction = -1;
+  } else if(iscntrl(key) || (key >= 0x100)) {
+    start_match_rx = start_match_row = 0;
+    direction = 1;
+    return;
   } else {
     start_match_rx = 0;
     start_match_row = 0;
@@ -833,6 +1001,14 @@ void editor_find_callback(char *query, int key) {
 
       // cause editor_scroll() to place matching line at top of screen
       E.row_off = E.num_rows;
+
+      // Save hl before tagging
+      saved_hl_row = current_row;
+      saved_hl = malloc(row->r_size);
+      memcpy(saved_hl, row->hl, row->r_size);
+
+      // Tag matched region
+      memset(&row->hl[match_rx], HL_MATCH, strlen(query));
 
       return;
     } else {
@@ -947,6 +1123,10 @@ void editor_process_key(void) {
 
     case CTRL_KEY('f'):
       editor_find();
+      break;
+
+    case CTRL_KEY('k'):
+      editor_del_row(E.cy);
       break;
 
     // Enter
@@ -1093,6 +1273,9 @@ void init_editor() {
 
   // Not dirty
   E.dirty = 0;
+
+  // No syntax
+  E.syntax = NULL;
 }
 
 int main(int argc, char** argv) {
