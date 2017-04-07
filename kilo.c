@@ -120,6 +120,10 @@ enum special_keys {
   PAGE_DOWN,
 };
 
+//// PROTOTYPES
+
+char* editor_prompt(char* prompt);
+
 //// UTILITY
 
 // Print an error message and terminate the program with an error status.
@@ -710,7 +714,14 @@ char* editor_rows_to_string(int *buflen) {
 
 // Write the editor contents to the current filename.
 void editor_save(void) {
-  if(E.filename == NULL) { return; }
+  if(E.filename == NULL) {
+    // Prompt user for filename
+    E.filename = editor_prompt("Save as: %s");
+    if(E.filename == NULL) {
+      editor_set_status_message("Save aborted");
+      return;
+    }
+  }
 
   // Convert editor rows to a string for saving
   int len;
@@ -868,6 +879,50 @@ void editor_process_key(void) {
       // Insert character directly if it is a byte and not a control char
       if((c < 0x100) && !iscntrl(c)) { editor_insert_char(c); }
       break;
+  }
+}
+
+// Prompt for input from the user. Returns a string from the user which should be
+// free()-ed when done with. The promp should include a "%s" which is replaced with the
+// user's input as they type.
+char* editor_prompt(char* prompt) {
+  // allocate input buffer
+  size_t buf_size = 128;
+  char* buf = malloc(buf_size);
+
+  // initialise buffer
+  size_t buf_len = 0;
+  buf[0] = '\0';
+
+  while(1) {
+    editor_set_status_message(prompt, buf);
+    editor_refresh_screen();
+
+    // super simple line editor
+    int c = editor_read_key();
+    if((c == ESCAPE_KEY) || (c == CTRL_KEY('c'))) {
+      // cancel on escape / Ctrl-C
+      editor_set_status_message("");
+      free(buf);
+      return NULL;
+    } else if(c == BACKSPACE) {
+      if(buf_len == 0) { continue; }
+      buf[--buf_len] = '\0';
+    } else if(c == ENTER_KEY) {
+      // return buffer to caller if non-empty
+      if(buf_len != 0) {
+        editor_set_status_message("");
+        return buf;
+      }
+    } else if(!iscntrl(c)) {
+      // realloc buffer if necessary
+      if(buf_len == buf_size - 1) {
+        buf_size *= 2;
+        buf = realloc(buf, buf_size);
+      }
+      buf[buf_len++] = c;
+      buf[buf_len] = '\0';
+    }
   }
 }
 
