@@ -49,6 +49,9 @@ struct editor_config {
   // Current cursor position.
   int cx, cy;
 
+  // Desired cursor x position line length allowing
+  int desired_cx;
+
   // Current position within *rendered* line.
   int rx;
 
@@ -866,6 +869,9 @@ void editor_move_cursor(int key) {
   // Get row under current cursor
   erow *row = (E.cy >= E.num_rows) ? NULL : &(E.row[E.cy]);
 
+  // Anything other than vertical movement will reset the desired cx
+  int reset_desired_cx = (key != ARROW_UP) && (key != ARROW_DOWN);
+
   switch(key) {
     case ARROW_LEFT:
       if(E.cx > 0) {
@@ -898,9 +904,18 @@ void editor_move_cursor(int key) {
   // Get (possibly) new row under cursor
   row = (E.cy >= E.num_rows) ? NULL : &(E.row[E.cy]);
 
+  // Was this a vertical movement or one which resets the desired cx
+  if(reset_desired_cx) {
+    E.desired_cx = E.cx;
+  } else {
+    E.cx = E.desired_cx;
+  }
+
   // Snap cx to new row
   int rowlen = row ? row->size : 0;
-  if(E.cx > rowlen) { E.cx = rowlen; }
+  if(E.cx > rowlen) {
+    E.cx = rowlen;
+  }
 }
 
 // Read and process one key from the keyboard.
