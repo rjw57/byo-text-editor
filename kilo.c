@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -54,6 +55,9 @@ struct editor_config {
   // Current scroll offset.
   int row_off, col_off;
 
+  // Non zero if buffer has been modified w.r.t. the file on disk.
+  int dirty;
+
   // Number of rows in file
   int num_rows;
 
@@ -80,20 +84,28 @@ struct editor_config E;
 // Editor version string
 #define KILO_VERSION "0.0.1"
 
-// Byte corresponding to CTRL-<key>
-#define CTRL_KEY(key) ((key) & 0x1f)
-
-// Coerce string to uint8_t pointer
-#define U8(str) ((uint8_t*)(str))
-
 // Tab stop size
 #define KILO_TAB_STOP 8
 
 // Time (in seconds) to display status messages
 #define KILO_MSG_TIMEOUT 5
 
-// Special key values
+// Number of times quit command must be issued if the buffer is dirty
+#define KILO_QUIT_TIMES 3
+
+// Byte corresponding to CTRL-<key>
+#define CTRL_KEY(key) ((key) & 0x1f)
+
+// Coerce string to uint8_t pointer
+#define U8(str) ((uint8_t*)(str))
+
+// Special key values. Those which do not map to a single ASCII value all have
+// values > 0xff so that they are not byte values.
 enum special_keys {
+  ENTER_KEY = '\r', // formally: carriage return
+  ESCAPE_KEY = '\x1b',
+  BACKSPACE = 127,
+
   ARROW_LEFT = 0x1000,
   ARROW_RIGHT,
   ARROW_UP,
@@ -304,21 +316,180 @@ void editor_update_row(erow* row) {
   row->r_size = idx;
 }
 
-// Append a row to the file
-void editor_append_row(uint8_t *buf, size_t len) {
-  E.row = realloc(E.row, sizeof(erow) * (E.num_rows + 1));
+// Free resources associated with a row
+void editor_free_row(erow* row) {
+  free(row->render);
+  free(row->chars);
+}
 
-  int at = E.num_rows;
+// Delete a row from the file
+void editor_del_row(int at) {
+  // Bounds check
+  if((at < 0) || (at >= E.num_rows)) { return; }
+
+  // Free resources for the row
+  editor_free_row(&E.row[at]);
+
+  // Shuffle other rows up
+  memmove(&E.row[at], &E.row[at+1], sizeof(erow) * (E.num_rows - at - 1));
+  E.num_rows--;
+
+  // Set dirty bit
+  E.dirty = 1;
+}
+
+// Insert a row in the file. If buf is non-NULL it is the contents of the new
+// row.
+void editor_insert_row(int at, uint8_t *buf, size_t len) {
+  // bounds check
+  if((at < 0) || (at > E.num_rows)) { return; }
+
+  // Make room for new row and shuffle array
+  E.row = realloc(E.row, sizeof(erow) * (E.num_rows + 1));
+  memmove(&E.row[at+1], &E.row[at], sizeof(erow) * (E.num_rows - at));
+  E.num_rows++;
+
+  // Initialise row
+  if(!buf) { len = 0; }
   E.row[at].size = len;
   E.row[at].chars = malloc(len + 1);
   memcpy(E.row[at].chars, buf, len);
   E.row[at].chars[len] = '\0';
 
+  // Re-render row
   E.row[at].r_size = 0;
   E.row[at].render = NULL;
   editor_update_row(&E.row[at]);
 
-  ++E.num_rows;
+  // set dirty bit
+  E.dirty = 1;
+}
+
+// Append an array of bytes to a row
+void editor_row_append_string(erow *row, uint8_t* s, size_t len) {
+  // make space for new characters
+  row->chars = realloc(row->chars, row->size + len + 1);
+
+  // copy bytes to end of row
+  memcpy(&row->chars[row->size], s, len);
+  row->size += len;
+
+  // add terminating NUL
+  row->chars[row->size] = '\0';
+
+  // re-render row
+  editor_update_row(row);
+
+  // set dirty bit
+  E.dirty = 1;
+}
+
+// Insert a character into an existing row
+void editor_row_insert_char(erow *row, int at, uint8_t c) {
+  // clip at to lie within row or just beyond it
+  if((at < 0) || (at > row->size)) { at = row->size; }
+
+  // make room in buffer
+  row->chars = realloc(row->chars, row->size + 2);
+
+  // shift characters from insertion point forward one
+  memmove(&row->chars[at+1], &row->chars[at], row->size - at + 1);
+  row->size++;
+
+  // insert new character
+  row->chars[at] = c;
+
+  // re-render row
+  editor_update_row(row);
+
+  // set dirty bit
+  E.dirty = 1;
+}
+
+// Remove character at an index within row
+void editor_row_del_char(erow *row, int at) {
+  // check bounds
+  if((at < 0) || (at >= row->size)) { return; }
+
+  // shuffle characters beyond deletion point backwards
+  memmove(&row->chars[at], &row->chars[at+1], row->size - at);
+  row->size--;
+
+  // re-render row
+  editor_update_row(row);
+
+  // set sirty bit
+  E.dirty = 1;
+}
+
+//// EDITING OPERATIONS
+
+// insert a character at cursor
+void editor_insert_char(uint8_t c) {
+  // insert a blank row at end of file if we're on the last line
+  if(E.cy == E.num_rows) {
+    editor_insert_row(E.num_rows, U8(""), 0);
+  }
+
+  // insert the character
+  editor_row_insert_char(&E.row[E.cy], E.cx, c);
+
+  // advance cursor
+  E.cx++;
+}
+
+// delete character to the left of cursor
+void editor_del_char(void) {
+  // don't do anything at extreme ends of file
+  if(E.cy == E.num_rows) { return; }
+  if((E.cx == 0) && (E.cy == 0)) { return; }
+
+  erow *row = &E.row[E.cy];
+
+  if(E.cx > 0) {
+    editor_row_del_char(row, E.cx - 1);
+    E.cx--;
+  } else {
+    // join row to previous row. We know cy > 0 due to check above but we assert
+    // here for documentation and sanity checking
+    assert(E.cy > 0);
+
+    // Move cursor horizontally to end of previous row
+    E.cx = E.row[E.cy - 1].size;
+
+    // Join row to previous row
+    editor_row_append_string(&E.row[E.cy-1], row->chars, row->size);
+    editor_del_row(E.cy);
+    E.cy--;
+
+  }
+}
+
+// Insert a newline at current cursor
+void editor_insert_new_line(void) {
+  if(E.cx == 0) {
+    // Simply insert a new row *above* this one
+    editor_insert_row(E.cy, U8(""), 0);
+  } else {
+    // The check above should guard against cy being == num_rows but sanity
+    // check.
+    assert(E.cy < E.num_rows);
+
+    // Split row at insert point by first inserting a new row with the
+    // rightmost portion ...
+    erow *row = &E.row[E.cy];
+    editor_insert_row(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+
+    // ... and truncate the current row
+    row = &E.row[E.cy]; // N.B. editor_insert_row() may have realloc-ed E.row
+    row->size = E.cx;
+    row->chars[row->size] = '\0';
+    editor_update_row(row);
+  }
+
+  // Move cursor to start of new row
+  E.cy++;
+  E.cx = 0;
 }
 
 //// OUTPUT
@@ -397,8 +568,8 @@ void editor_draw_status_bar(struct abuf *ab) {
 
   char status[80], rstatus[80];
   int len = snprintf(status, sizeof(status),
-      " %.20s - %d lines", E.filename ? E.filename : "[No Name]",
-      E.num_rows);
+      " %.20s - %d lines %s", E.filename ? E.filename : "[No Name]",
+      E.num_rows, E.dirty ? "(modified)" : "");
   if(len > E.screen_cols) { len = E.screen_cols; }
   ab_append(ab, (uint8_t*)status, len);
 
@@ -500,11 +671,75 @@ void editor_open(const char* filename) {
       --linelen;
     }
 
-    editor_append_row((uint8_t*) line, linelen);
+    editor_insert_row(E.num_rows, (uint8_t*) line, linelen);
   }
 
   free(line);
   fclose(fp);
+
+  // Reset dirty bit
+  E.dirty = 0;
+}
+
+// Write all the rows to a single string. Returns the length of the allocated
+// buffer in buflen. Set buflen to NULL if you don't care about the length. The
+// returned string should be free()-ed when done.
+char* editor_rows_to_string(int *buflen) {
+  int totlen = 0;
+
+  // Work out the total length of all the rows
+  for(int j=0; j < E.num_rows; ++j) {
+    totlen += E.row[j].size + 1; // + 1 for newline
+  }
+  if(buflen) { *buflen = totlen; }
+
+  // Allocate a buffer to hold the string
+  char *buf = malloc(totlen);
+
+  // Walk each row copying the bytes
+  char *p = buf;
+  for(int j=0; j < E.num_rows; ++j) {
+    memcpy(p, E.row[j].chars, E.row[j].size);
+    p += E.row[j].size;
+    *p = '\n'; // Add newline
+    ++p;
+  }
+
+  return buf;
+}
+
+// Write the editor contents to the current filename.
+void editor_save(void) {
+  if(E.filename == NULL) { return; }
+
+  // Convert editor rows to a string for saving
+  int len;
+  char *buf = editor_rows_to_string(&len);
+
+  // Open the file for writing and truncate it should the file have already
+  // existed.
+  int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+  if(fd != -1) {
+    if(-1 != ftruncate(fd, len)) {
+      // Write contents of file
+      if(len == write(fd, buf, len)) {
+        close(fd);
+        free(buf);
+        editor_set_status_message("%d bytes written", len);
+
+        // Reset dirty bit
+        E.dirty = 0;
+        return;
+      }
+    }
+    close(fd);
+  }
+
+  // Free string storage
+  free(buf);
+
+  // This path through the function indicates an error saving, report this.
+  editor_set_status_message("error saving: %s", strerror(errno));
 }
 
 //// INPUT HANDLING
@@ -553,11 +788,45 @@ void editor_move_cursor(int key) {
 
 // Read and process one key from the keyboard.
 void editor_process_key(void) {
+  static int quit_times = KILO_QUIT_TIMES; // quit time counter
   int c = editor_read_key();
+
+  // Reset quit times count if anything other than quit is pressed
+  if(c != CTRL_KEY('q')) { quit_times = KILO_QUIT_TIMES; }
 
   switch(c) {
     case CTRL_KEY('q'):
+      if(E.dirty && (quit_times > 0)) {
+        editor_set_status_message("File has unsaved changes. "
+            "Press Ctrl-Q %d more time%s to quit.",
+            quit_times, quit_times == 1 ? "" : "s");
+        --quit_times;
+        return;
+      }
       exit(EXIT_SUCCESS);
+      break;
+
+    case CTRL_KEY('s'):
+      editor_save();
+      break;
+
+    // Enter
+    case ENTER_KEY:
+      editor_insert_new_line();
+      break;
+
+    // the various spellings of "backspace"
+    case CTRL_KEY('h'):
+    case BACKSPACE:
+    case DEL_KEY:
+      if(c == DEL_KEY) { editor_move_cursor(ARROW_RIGHT); }
+      editor_del_char();
+      break;
+
+    // Escape
+    case CTRL_KEY('l'):
+    case ESCAPE_KEY:
+      // Ignore
       break;
 
     case HOME_KEY:
@@ -596,7 +865,8 @@ void editor_process_key(void) {
       break;
 
     default:
-      // NOP
+      // Insert character directly if it is a byte and not a control char
+      if((c < 0x100) && !iscntrl(c)) { editor_insert_char(c); }
       break;
   }
 }
@@ -632,6 +902,9 @@ void init_editor() {
   // No status
   E.status_msg[0] = '\0';
   E.status_msg_time = 0;
+
+  // Not dirty
+  E.dirty = 0;
 }
 
 int main(int argc, char** argv) {
