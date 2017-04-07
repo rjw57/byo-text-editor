@@ -511,6 +511,9 @@ void editor_insert_new_line(void) {
       n_blank++;
     }
 
+    // Don't go beyond the current cursor position
+    if(n_blank > E.cx) { n_blank = E.cx; }
+
     // Split row at insert point by first inserting a new row with the
     // blank characters which begin this row ...
     editor_insert_row(E.cy + 1, row->chars, n_blank);
@@ -520,7 +523,7 @@ void editor_insert_new_line(void) {
     editor_row_append_string(&E.row[E.cy + 1], &row->chars[E.cx], row->size - E.cx);
 
     // ... and truncate the current row
-    row->size = E.cx;
+    row->size = (E.cx == n_blank) ? 0 : E.cx;
     row->chars[row->size] = '\0';
     editor_update_row(row);
 
