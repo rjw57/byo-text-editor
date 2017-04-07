@@ -488,6 +488,8 @@ void editor_del_char(void) {
 
 // Insert a newline at current cursor
 void editor_insert_new_line(void) {
+  int new_cx = 0;
+
   if(E.cx == 0) {
     // Simply insert a new row *above* this one
     editor_insert_row(E.cy, U8(""), 0);
@@ -496,21 +498,36 @@ void editor_insert_new_line(void) {
     // check.
     assert(E.cy < E.num_rows);
 
-    // Split row at insert point by first inserting a new row with the
-    // rightmost portion ...
+    // Find current row
     erow *row = &E.row[E.cy];
-    editor_insert_row(E.cy + 1, &row->chars[E.cx], row->size - E.cx);
+
+    // How many blank characters start this row?
+    int n_blank = 0;
+    for(int i=0; i<row->size; ++i) {
+      if(!isblank(row->chars[i])) { break; }
+      n_blank++;
+    }
+
+    // Split row at insert point by first inserting a new row with the
+    // blank characters which begin this row ...
+    editor_insert_row(E.cy + 1, row->chars, n_blank);
+    row = &E.row[E.cy]; // insert row might have realloc()-ed array
+
+    // ... then append rightmost portion of current row ...
+    editor_row_append_string(&E.row[E.cy + 1], &row->chars[E.cx], row->size - E.cx);
 
     // ... and truncate the current row
-    row = &E.row[E.cy]; // N.B. editor_insert_row() may have realloc-ed E.row
     row->size = E.cx;
     row->chars[row->size] = '\0';
     editor_update_row(row);
+
+    // the new cx should be the number of blank characters
+    new_cx = n_blank;
   }
 
   // Move cursor to start of new row
   E.cy++;
-  E.cx = 0;
+  E.cx = new_cx;
 }
 
 //// OUTPUT
