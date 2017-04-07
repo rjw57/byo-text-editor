@@ -49,8 +49,8 @@ struct editor_config {
   // Current cursor position.
   int cx, cy;
 
-  // Desired cursor x position line length allowing
-  int desired_cx;
+  // Desired rendered x position, line length allowing
+  int desired_rx;
 
   // Current position within *rendered* line.
   int rx;
@@ -873,7 +873,7 @@ void editor_move_cursor(int key) {
   erow *row = (E.cy >= E.num_rows) ? NULL : &(E.row[E.cy]);
 
   // Anything other than vertical movement will reset the desired cx
-  int reset_desired_cx = (key != ARROW_UP) && (key != ARROW_DOWN);
+  int reset_desired_rx = (key != ARROW_UP) && (key != ARROW_DOWN);
 
   switch(key) {
     case ARROW_LEFT:
@@ -908,10 +908,10 @@ void editor_move_cursor(int key) {
   row = (E.cy >= E.num_rows) ? NULL : &(E.row[E.cy]);
 
   // Was this a vertical movement or one which resets the desired cx
-  if(reset_desired_cx) {
-    E.desired_cx = E.cx;
+  if(reset_desired_rx) {
+    E.desired_rx = row ? editor_row_cx_to_rx(row, E.cx) : 0;
   } else {
-    E.cx = E.desired_cx;
+    E.cx = row ? editor_row_rx_to_cx(row, E.desired_rx) : 0;
   }
 
   // Snap cx to new row
