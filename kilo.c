@@ -355,7 +355,7 @@ int editor_read_key(void) {
 
 //// SYNTAX HIGHLIGHTING
 
-// returns non-zero id c is a separator character
+// returns non-zero if c is a separator character
 int is_separator(int c) {
   return isspace(c) || (c == '\0') || (strchr(",.()+-/*=~%<>[];", c) != NULL);
 }
@@ -369,7 +369,7 @@ void editor_update_syntax(erow* row) {
   // if there's no syntax highlighting info, that's all
   if(E.syntax == NULL) { return; }
 
-  // was previous character a separator
+  // was previous character a separator?
   int prev_sep = 1;
 
   // are we within a string? if so, set this to the terminating char.
