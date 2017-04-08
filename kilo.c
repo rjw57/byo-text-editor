@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -96,6 +97,9 @@ struct editor_config {
 
   // Syntax highlighting information for current file
   struct editor_syntax* syntax;
+
+  // Flag indicating the terminal has resized
+  int term_resized;
 };
 
 //// GLOBALS
@@ -164,6 +168,8 @@ enum special_keys {
 
   PAGE_UP,
   PAGE_DOWN,
+
+  TERM_RESIZE_KEY,
 };
 
 // Syntax highlighting tokens
@@ -293,6 +299,9 @@ int editor_read_key(void) {
   while((n_read = read(STDIN_FILENO, &c, 1)) != 1) {
     // Under Cygwin, read() sets EAGAIN rather then returning 0 bytes.
     if((n_read == -1) && (errno != EAGAIN)) { die("read"); }
+
+    // Handle terminal resize as a "special" key
+    if(E.term_resized) { return TERM_RESIZE_KEY; }
   }
 
   // Handle escape sequences
@@ -1258,6 +1267,11 @@ void editor_process_key(void) {
   if(c != CTRL_KEY('q')) { quit_times = KILO_QUIT_TIMES; }
 
   switch(c) {
+    case TERM_RESIZE_KEY:
+      // all we need to do is re-render screen
+      E.term_resized = 0;
+      break;
+    
     case CTRL_KEY('q'):
       if(E.dirty && (quit_times > 0)) {
         editor_set_status_message("File has unsaved changes. "
@@ -1407,7 +1421,9 @@ char* editor_prompt(char* prompt, prompt_cb cb) {
 
 //// MAIN LOOP
 
-void init_editor() {
+void terminal_resized(int sig) {
+  if(sig != SIGWINCH) { return; }
+
   // Obtain terminal window size
   if(-1 == get_window_size(&E.screen_rows, &E.screen_cols)) {
     die("window size");
@@ -1420,6 +1436,16 @@ void init_editor() {
     die("terminal too small");
   }
 
+  // Set flag
+  E.term_resized = 1;
+}
+
+void init_editor(void) {
+  // Get initial size of terminal and register terminal size change handler
+  terminal_resized(SIGWINCH);
+  E.term_resized = 0;
+  signal(SIGWINCH, terminal_resized);
+  
   // Reset cursor position
   E.rx = E.cx = E.cy = 0;
 
