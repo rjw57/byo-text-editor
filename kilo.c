@@ -30,11 +30,13 @@ struct abuf {
 
 // A row of display text
 typedef struct erow {
+  int idx; // position of this row within the file
   ssize_t size;
   ssize_t r_size;
   uint8_t* chars;
   uint8_t* render;
   uint8_t* hl; // token types for each byte in render
+  int hl_open_comment; // does this row end in an un-closed multiline comment?
 } erow;
 
 // Syntax highlighting flags
@@ -47,6 +49,8 @@ struct editor_syntax {
   char **filematch; // filename patterns
   int flags; // what highlighting to perform
   char *singleline_comment_start; // how do single line comments start?
+  char *multiline_comment_start;
+  char *multiline_comment_end;
   char **keywords; // NULL-terminated array of keywords (2nd-ary term. with "|")
 };
 
@@ -114,8 +118,8 @@ char *C_HL_keywords[] = {
 
 struct editor_syntax HLDB[] = {
   {
-    "c", C_HL_extensions, HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS, "//",
-    C_HL_keywords,
+    "c", C_HL_extensions, HL_HIGHLIGHT_NUMBERS | HL_HIGHLIGHT_STRINGS,
+    "//", "/*", "*/", C_HL_keywords,
   },
 };
 
@@ -166,6 +170,7 @@ enum special_keys {
 enum highlight_tokens {
   HL_NORMAL = 0,
   HL_COMMENT,
+  HL_MLCOMMENT,
   HL_KEYWORD1,
   HL_KEYWORD2,
   HL_STRING,
@@ -361,9 +366,17 @@ void editor_update_syntax(erow* row) {
   // are we within a string? if so, set this to the terminating char.
   int in_string = 0;
 
-  // what (if any) prefix denotes single line comments
+  // Are we within a multiline comment from the previous row?
+  int in_comment = (row->idx > 0) && (E.row[row->idx-1].hl_open_comment);
+
+  // what (if any) prefix denotes single and multi line comments
   char* scs = E.syntax->singleline_comment_start;
+  char* mcs = E.syntax->multiline_comment_start;
+  char* mce = E.syntax->multiline_comment_end;
+  
   int scs_len = scs ? strlen(scs) : 0;
+  int mcs_len = mcs ? strlen(mcs) : 0;
+  int mce_len = mce ? strlen(mce) : 0;
 
   // keywords
   char **keywords = E.syntax->keywords;
@@ -373,11 +386,32 @@ void editor_update_syntax(erow* row) {
     char c = row->render[i];
     uint8_t prev_hl = (i > 0) ? row->hl[i - 1] : HL_NORMAL;
 
-    if(scs_len && !in_string) {
+    if(scs_len && !in_string && !in_comment) {
       if(!strncmp((char*)&row->render[i], scs, scs_len)) {
         // rest of line is a comment
         memset(&row->hl[i], HL_COMMENT, row->r_size - i);
-        return;
+        break;
+      }
+    }
+
+    if(mcs_len && mce_len && !in_string) {
+      if(in_comment) {
+        row->hl[i] = HL_MLCOMMENT;
+        if(!strncmp((char*)&row->render[i], mce, mce_len)) {
+          memset(&row->hl[i], HL_MLCOMMENT, mce_len);
+          i += mce_len;
+          in_comment = 0;
+          prev_sep = 1;
+          continue;
+        } else {
+          ++i;
+          continue;
+        }
+      } else if(!strncmp((char*)&row->render[i], mcs, mcs_len)) {
+        memset(&row->hl[i], HL_MLCOMMENT, mcs_len);
+        i += mcs_len;
+        in_comment = 1;
+        continue;
       }
     }
 
@@ -438,12 +472,22 @@ void editor_update_syntax(erow* row) {
     prev_sep = is_separator(c);
     ++i;
   }
+
+  // look to see if the multiline comment flag changed
+  int changed = (row->hl_open_comment != in_comment);
+  row->hl_open_comment = in_comment;
+  if(changed && (row->idx + 1 < E.num_rows)) {
+    // update syntax for row underneath us if necessary
+    editor_update_syntax(&E.row[row->idx+1]);
+  }
 }
 
 // Convert a syntax highlight token to the corresponding ANSI color code
 int editor_syntax_to_colour(int hl) {
   switch(hl) {
-    case HL_COMMENT: return 36; // cyan
+    case HL_MLCOMMENT:
+    case HL_COMMENT:
+      return 36; // cyan
     case HL_KEYWORD1: return 33; // yellow
     case HL_KEYWORD2: return 32; // green
     case HL_STRING: return 35; // magenta
@@ -558,6 +602,11 @@ void editor_del_row(int at) {
   memmove(&E.row[at], &E.row[at+1], sizeof(erow) * (E.num_rows - at - 1));
   E.num_rows--;
 
+  // Each row now needs its idx reducing
+  for(int i=at; i<E.num_rows; ++i) {
+    E.row[at].idx--;
+  }
+
   // Set dirty bit
   E.dirty = 1;
 }
@@ -573,8 +622,14 @@ void editor_insert_row(int at, uint8_t *buf, size_t len) {
   memmove(&E.row[at+1], &E.row[at], sizeof(erow) * (E.num_rows - at));
   E.num_rows++;
 
+  // For each row below ours, idx needs incrementing
+  for(int i=at+1; i<E.num_rows; ++i) {
+    E.row[i].idx++;
+  }
+
   // Initialise row
   if(!buf) { len = 0; }
+  E.row[at].idx = at;
   E.row[at].size = len;
   E.row[at].chars = malloc(len + 1);
   memcpy(E.row[at].chars, buf, len);
@@ -588,6 +643,9 @@ void editor_insert_row(int at, uint8_t *buf, size_t len) {
 
   // set dirty bit
   E.dirty = 1;
+
+  // reset multiline comment flag
+  E.row[at].hl_open_comment = 0;
 }
 
 // Append an array of bytes to a row
@@ -806,7 +864,20 @@ void editor_draw_rows(struct abuf *ab) {
       // append string with colours
       int current_colour = -1;
       for(int j=0; j<len; ++j) {
-        if(hl[j] == HL_NORMAL) {
+        if(!isprint(c[j])) {
+          // display control characters in reverse video
+          uint8_t sym = (c[j] < 26) ? '@' + c[j] : '?';
+          ab_append(ab, U8("\x1b[7m"), 4);
+          ab_append(ab, &sym, 1);
+          ab_append(ab, U8("\x1b[m"), 3);
+
+          // Restore colour if necessary
+          if(current_colour != -1) {
+            uint8_t buf[16];
+            int clen = snprintf((char*)buf, sizeof(buf), "\x1b[%dm", current_colour);
+            ab_append(ab, buf, clen);
+          }
+        } else if(hl[j] == HL_NORMAL) {
           // only reset colour if necessary
           if(current_colour != -1) {
             ab_append(ab, U8("\x1b[39m"), 5);
@@ -1131,9 +1202,6 @@ void editor_move_cursor(int key) {
   // Get row under current cursor
   erow *row = (E.cy >= E.num_rows) ? NULL : &(E.row[E.cy]);
 
-  // Anything other than vertical movement will reset the desired cx
-  int reset_desired_rx = (key != ARROW_UP) && (key != ARROW_DOWN);
-
   switch(key) {
     case ARROW_LEFT:
       if(E.cx > 0) {
@@ -1166,10 +1234,8 @@ void editor_move_cursor(int key) {
   // Get (possibly) new row under cursor
   row = (E.cy >= E.num_rows) ? NULL : &(E.row[E.cy]);
 
-  // Was this a vertical movement or one which resets the desired cx
-  if(reset_desired_rx) {
-    E.desired_rx = row ? editor_row_cx_to_rx(row, E.cx) : 0;
-  } else {
+  // Was this a vertical movement?
+  if((key == ARROW_UP) || (key == ARROW_DOWN)) {
     E.cx = row ? editor_row_rx_to_cx(row, E.desired_rx) : 0;
   }
 
@@ -1184,6 +1250,9 @@ void editor_move_cursor(int key) {
 void editor_process_key(void) {
   static int quit_times = KILO_QUIT_TIMES; // quit time counter
   int c = editor_read_key();
+
+  // Was this a vertical movement command?
+  int was_vert = 0;
 
   // Reset quit times count if anything other than quit is pressed
   if(c != CTRL_KEY('q')) { quit_times = KILO_QUIT_TIMES; }
@@ -1243,6 +1312,8 @@ void editor_process_key(void) {
     case PAGE_UP:
     case PAGE_DOWN:
       {
+        was_vert = 1;
+        
         // Position cursor at top or bottom of page depending on keypress
         if(c == PAGE_UP) {
           E.cy = E.row_off;
@@ -1261,15 +1332,27 @@ void editor_process_key(void) {
 
     case ARROW_UP:
     case ARROW_DOWN:
+      was_vert = 1;
+      // fall through...
     case ARROW_LEFT:
     case ARROW_RIGHT:
       editor_move_cursor(c);
       break;
 
     default:
-      // Insert character directly if it is a byte and not a control char
-      if((c < 0x100) && !iscntrl(c)) { editor_insert_char(c); }
+      // Insert character directly if it is a byte and not a special key
+      if(c < 0x100) { editor_insert_char(c); }
       break;
+  }
+
+  // if movement wasn't vertical, reset desired rx
+  if(!was_vert) {
+    if(E.cy < E.num_rows) {
+      erow* row = &E.row[E.cy];
+      E.desired_rx = editor_row_cx_to_rx(row, E.cx);
+    } else {
+      E.desired_rx = 0;
+    }
   }
 }
 
